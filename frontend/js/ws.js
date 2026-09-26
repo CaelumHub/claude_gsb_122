@@ -19,6 +19,9 @@ const LS = {
   clientId: (boardId) => `wb_client_${boardId}`,
 };
 
+/* 客户端 op_id 去重窗口大小(服务端幂等窗口为 8192, 留有余量) */
+const SEEN_OPS_LIMIT = 10000;
+
 function lsGet(key, fallback = null) {
   try {
     const raw = localStorage.getItem(key);
@@ -63,6 +66,8 @@ export class BoardSocket {
     this._pingTimer = null;
     this._watchdog = null;
     this._reconnectTimer = null;
+    this._seenOps = new Set();      // 已合并的 op_id(至少一次投递 → 恰好一次)
+    this._seenQueue = [];           // FIFO 驱逐队列(与 _seenOps 同步)
     this.onStatusChange = opts.onStatusChange || null;
     window.addEventListener('online', () => { if (this.status === 'reconnecting') this.connect(); });
   }
@@ -181,7 +186,15 @@ export class BoardSocket {
       if (msg.state) {
         this.lastRev = msg.state.rev ?? msg.head_rev ?? 0;
         this._saveRev();
-      } else if (msg.catchup?.ops?.length) {
+      } else if (msg.catchup) {
+        if (!this._verifyCatchup(msg.catchup, msg.head_rev)) {
+          // 补发窗口无法闭合缺口 → 明确退回全量状态, 绝不推进 lastRev
+          // 把缺口静默吞掉(否则只有整页刷新才能恢复一致)
+          this._resyncFromScratch('catchup-incomplete');
+          return;
+        }
+        // 去重后交回给页面合并(重连竞态下同一操作可能既被广播又被补发)
+        msg.catchup.ops = this._filterFresh(msg.catchup.ops);
         this._applyCatchup(msg.catchup.ops);
       }
       if (msg.head_rev != null) { this.lastRev = Math.max(this.lastRev, msg.head_rev); this._saveRev(); }
@@ -190,8 +203,9 @@ export class BoardSocket {
       return;
     }
     if (type === 'ops') {
-      if (msg.head_rev != null) { this.lastRev = msg.head_rev; this._saveRev(); }
-      this.emit('ops', msg);
+      if (msg.head_rev != null) { this.lastRev = Math.max(this.lastRev, msg.head_rev); this._saveRev(); }
+      msg.ops = this._filterFresh(msg.ops);
+      if (msg.ops.length) this.emit('ops', msg);
       return;
     }
     if (type === 'ack') {
@@ -205,7 +219,62 @@ export class BoardSocket {
     }
     if (type === 'ping') { this._send({ type: 'ping' }); return; }   // 服务端心跳 → 应答
     if (type === 'pong') return;
+    if (type === 'error' && msg.code === 'invalid_op' && Array.isArray(msg.rejected)) {
+      // 校验失败的操作永远不会被接受: 移出补发队列, 防止毒化后续每次重连
+      this._removePending(new Set(msg.rejected));
+    }
     this.emit(type, msg);
+  }
+
+  /* ------------------------------------------------------------ 补发校验与去重 */
+  /** 校验补发窗口恰好连续覆盖 (lastRev, headRev]; 覆盖不了返回 false。 */
+  _verifyCatchup(catchup, headRev) {
+    const fromRev = Number(catchup && catchup.from_rev);
+    const head = Number(headRev);
+    if (!Number.isFinite(fromRev) || !Number.isFinite(head)) return false;
+    if (fromRev !== this.lastRev) return false;        // 必须正好接上本地进度
+    const ops = Array.isArray(catchup.ops) ? catchup.ops : [];
+    const expect = head - fromRev;
+    if (expect < 0 || ops.length !== expect) return false;
+    for (let i = 0; i < ops.length; i += 1) {
+      if (Number(ops[i] && ops[i].rev) !== fromRev + i + 1) return false;
+    }
+    return true;
+  }
+
+  /** 补发链路闭合不了缺口时: 丢弃本地 rev 进度并重连, 让服务端发全量状态。 */
+  _resyncFromScratch(reason) {
+    this.lastRev = 0;
+    this._saveRev();
+    this.emit('resync', { reason });
+    try { this.ws && this.ws.close(); } catch { /* 忽略 */ }
+    // onclose → 自动重连 → hello(last_rev=0) → 服务端下发全量 state
+  }
+
+  /**
+   * op_id 去重(至少一次投递 → 恰好一次)。
+   * move 是增量操作, 重复合并会双倍位移, 因此广播/补发/本地回声
+   * 统一按 op_id 幂等; 窗口有界, 与后端 _seen 同思路。
+   */
+  _markSeen(opId) {
+    if (!opId || this._seenOps.has(opId)) return;
+    this._seenOps.add(opId);
+    this._seenQueue.push(opId);
+    if (this._seenQueue.length > SEEN_OPS_LIMIT) {
+      this._seenOps.delete(this._seenQueue.shift());
+    }
+  }
+
+  /** 过滤掉已见过的操作并把新操作登记进窗口; 返回可安全合并的子集。 */
+  _filterFresh(ops) {
+    const fresh = [];
+    for (const op of ops || []) {
+      const oid = op && op.op_id;
+      if (oid && this._seenOps.has(oid)) continue;
+      if (oid) this._markSeen(oid);
+      fresh.push(op);
+    }
+    return fresh;
   }
 
   _applyCatchup(ops) {
@@ -226,6 +295,8 @@ export class BoardSocket {
   sendOps(ops) {
     const list = Array.isArray(ops) ? ops : [ops];
     if (!list.length) return;
+    // 本地已乐观合并: 登记 op_id, 之后补发/广播里的回声不再重复合并
+    for (const op of list) if (op && op.op_id) this._markSeen(op.op_id);
     this.pending.push(...list);
     this._savePending();
     this._flushPending();

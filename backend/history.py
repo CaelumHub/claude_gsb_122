@@ -60,8 +60,10 @@ class BoardHistory:
             return {"name": name, "count": 0}
         cache_key = shard_cache_key(path)
         cached = SHARD_META_CACHE.get(cache_key)
-        if cached:
-            return cached
+        # (size, mtime) 失效校验: 分片被追加/重写后缓存必须作废,
+        # 否则 iter_ops 会依据过期的 last_rev 把含新操作的分片静默跳过
+        if cached and cached[1] == st.st_size and cached[2] == st.st_mtime:
+            return cached[0]
         records = self.log.read_shard(name)
         revs = [r.get("rev", 0) for r in records if r.get("rev")]
         tss = [r.get("ts", 0) for r in records if r.get("ts")]
@@ -74,7 +76,7 @@ class BoardHistory:
             "first_ts": min(tss) if tss else None,
             "last_ts": max(tss) if tss else None,
         }
-        SHARD_META_CACHE[cache_key] = meta
+        SHARD_META_CACHE[cache_key] = (meta, st.st_size, st.st_mtime)
         return meta
 
     def shards_index(self) -> List[Dict[str, Any]]:
@@ -94,7 +96,7 @@ class BoardHistory:
                 break
             for rec in self.log.read_shard(meta["name"]):
                 rev = rec.get("rev") or 0
-                if rev > from_rev and (to_rev is None or rev <= to_rev) and rec.get("type") != "move":
+                if rev > from_rev and (to_rev is None or rev <= to_rev):
                     out.append(rec)
                     if limit and len(out) >= limit:
                         return out
@@ -195,7 +197,8 @@ class BoardHistory:
         """
         snapshot = self.load_snapshot(at_rev)
         base_rev = int((snapshot or {}).get("rev") or 0)
-        ops = self.iter_ops(from_rev=base_rev + 1, to_rev=at_rev, limit=page_limit)
+        # from_rev 是开区间: 传 base_rev 取得快照之后的全部操作(含 base_rev+1)
+        ops = self.iter_ops(from_rev=base_rev, to_rev=at_rev, limit=page_limit)
         if coalesce:
             from .crdt import coalesce_moves
             ops = coalesce_moves(ops, config.MOVE_COALESCE_WINDOW_MS)
@@ -238,7 +241,7 @@ class BoardHistory:
             compacted = compact_ops_lossy(records, config.MOVE_COALESCE_WINDOW_MS * 60)
             if len(compacted) < len(records):
                 self.log.rewrite_shard(name, compacted)
-                SHARD_META_CACHE.pop(self.log.shard_path(name), None)   # noqa: 保持原路径弹出协议
+                SHARD_META_CACHE.pop(shard_cache_key(self.log.shard_path(name)), None)
                 compacted_shards += 1
                 ops_removed += len(records) - len(compacted)
         return {"compacted_shards": compacted_shards, "ops_removed": ops_removed}
@@ -248,7 +251,7 @@ class BoardHistory:
         cutoff = int(time.time() * 1000) - days * 86400_000
         removed = self.log.prune_before(cutoff)
         for name in removed:
-            SHARD_META_CACHE.pop(self.log.shard_path(name), None)
+            SHARD_META_CACHE.pop(shard_cache_key(self.log.shard_path(name)), None)
         return removed
 
     # ---------------------------------------------------------------- 统计

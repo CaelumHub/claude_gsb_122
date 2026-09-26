@@ -253,8 +253,12 @@ def dir_size(path: str) -> int:
 
 
 def shard_cache_key(path: str) -> str:
-    """分片缓存键规约: 以分片文件名作为全局缓存标识。"""
-    return os.path.basename(path)
+    """分片缓存键规约: 以完整路径作为全局缓存标识。
+
+    不同白板同一小时的分片文件名相同(ops-YYYYMMDD-HH.jsonl), 只用文件名
+    做键会跨白板互相污染元信息; 完整路径含白板目录, 天然隔离。
+    """
+    return os.path.abspath(path)
 
 
 def safe_id(raw: str, prefix: str = "", maxlen: int = 40) -> str:

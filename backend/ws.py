@@ -52,6 +52,27 @@ CURSOR_MSG_TYPES = {"presence", "cursor"}
 CLIENT_QUEUE_LIMIT = 800
 
 
+def contiguous_window(ops: List[Dict[str, Any]], last_rev: int,
+                      head_rev: int) -> Optional[List[Dict[str, Any]]]:
+    """从候选操作中提取恰好覆盖 (last_rev, head_rev] 的连续有序切片。
+
+    覆盖不完整(rev 缺口/数量不符/截断)一律返回 None —— 调用方据此降级
+    (ring → 磁盘 → 全量快照), 保证断线缺口要么被完整补全, 要么明确
+    退回全量状态, 绝不只补发一段然后把缺口静默吞掉。
+    """
+    if not ops or head_rev <= last_rev:
+        return None
+    window = [op for op in ops
+              if last_rev < int(op.get("rev") or 0) <= head_rev]
+    if len(window) != head_rev - last_rev:
+        return None
+    window.sort(key=lambda op: int(op.get("rev") or 0))
+    for expect, op in enumerate(window, start=last_rev + 1):
+        if int(op.get("rev") or 0) != expect:
+            return None
+    return window
+
+
 class Client:
     """一个 WS 连接(=一个浏览器标签页)。"""
 
@@ -119,11 +140,15 @@ class Room:
         for op in ops:
             self.ring.append(op)
 
-    def catchup_from_ring(self, last_rev: int) -> Optional[List[Dict[str, Any]]]:
-        """若环形缓冲覆盖 (last_rev, head] 全区间则返回切片, 否则 None。"""
-        if not self.ring:
-            return []
-        return [op for op in self.ring if int(op.get("rev") or 0) > last_rev]
+    def catchup_from_ring(self, last_rev: int,
+                          head_rev: int) -> Optional[List[Dict[str, Any]]]:
+        """若环形缓冲覆盖 (last_rev, head_rev] 全区间则返回切片, 否则 None。
+
+        覆盖不全(服务端重启清空了缓冲 / 高吞吐把旧操作挤出 maxlen)必须
+        返回 None 让调用方回落磁盘或全量快照 —— 返回部分切片或空列表
+        都会让客户端把 lastRev 推进到 head, 缺口被静默吞掉。
+        """
+        return contiguous_window(list(self.ring), last_rev, head_rev)
 
     @property
     def empty(self) -> bool:
@@ -254,24 +279,28 @@ class ConnectionManager:
             "server_time": int(time.time() * 1000),
         }
         gap = head_rev - client.last_rev
-        if client.last_rev == 0 or limit_catchup(gap, config.RING_BUFFER_OPS,
-                                                 config.MAX_CATCHUP_OPS):
+        # gap < 0: 客户端进度超前于服务端(数据回滚/换过数据目录) ——
+        # 本地 rev 已不可信, 同样明确退回全量, 不能让它永远卡住
+        if client.last_rev == 0 or gap < 0 or limit_catchup(gap, config.RING_BUFFER_OPS,
+                                                            config.MAX_CATCHUP_OPS):
             welcome["state"] = {
                 "rev": head_rev,
                 "shapes": doc.visible_shapes(),
             }
         elif gap > 0:
-            ops = room.catchup_from_ring(client.last_rev)
+            # 三级补发: ring → 磁盘分片日志 → 全量快照。
+            # 每一级都必须通过 contiguous_window 的完整覆盖校验,
+            # 覆盖不了就降级, 任何缺口都不允许静默丢弃。
+            ops = room.catchup_from_ring(client.last_rev, head_rev)
             source = "ring"
             if ops is None:
                 hist = history_service.for_board(board_id)
-                ops = await asyncio.get_running_loop().run_in_executor(
+                disk_ops = await asyncio.get_running_loop().run_in_executor(
                     None, lambda: hist.recent_ops(client.last_rev, config.MAX_CATCHUP_OPS))
+                ops = contiguous_window(disk_ops, client.last_rev, head_rev)
                 source = "disk"
-                if len(ops) > config.MAX_CATCHUP_OPS - 1:
-                    # 磁盘上依然太多 → 直接给全量
-                    ops = None
             if ops is None:
+                # 日志也无法闭合缺口(保留期清理/历史压缩等) → 明确退回全量
                 welcome["state"] = {"rev": head_rev, "shapes": doc.visible_shapes()}
             else:
                 welcome["catchup"] = {"from_rev": client.last_rev,
@@ -347,16 +376,29 @@ class ConnectionManager:
             return
         accepted = await manager.ingest_ops(client.board_id, raw_ops,
                                             by=client.user.get("username", ""))
+        # 校验失败的操作永远不会被接受: 把它们的 op_id 明确回给客户端,
+        # 让其从补发队列中移除, 避免毒化队列在每次重连时无限重发
+        accepted_ids = {op.get("op_id") for op in accepted}
+        rejected_ids = [str(op.get("op_id"))[:96] for op in raw_ops
+                        if isinstance(op, dict) and op.get("op_id")
+                        and op.get("op_id") not in accepted_ids]
         if not accepted:
             await self.send(client, {"type": "error", "code": "invalid_op",
-                                     "message": "操作被拒绝(校验失败)"})
+                                     "message": "操作被拒绝(校验失败)",
+                                     "rejected": rejected_ids})
             return
         doc = manager.docs.get(client.board_id)
         head_rev = doc.head_rev if doc else client.last_rev
         acks = [{"op_id": op["op_id"], "rev": op.get("rev"),
                  **({"dup": True} if op.get("dup") else {})} for op in accepted]
         await self.send(client, {"type": "ack", "acks": acks, "head_rev": head_rev})
-        fresh = [op for op in accepted if not op.get("dup") and op.get("type") != "move"]
+        if rejected_ids:
+            await self.send(client, {"type": "error", "code": "invalid_op",
+                                     "message": "部分操作未通过校验, 已丢弃",
+                                     "rejected": rejected_ids})
+        # 新接受的操作(含 move 增量)全部广播 + 进环形缓冲:
+        # 实时拖动对协作者可见, 断线补发才能从 ring 闭合缺口
+        fresh = [op for op in accepted if not op.get("dup")]
         if fresh:
             room.remember(fresh)
             await self.broadcast(client.board_id, {

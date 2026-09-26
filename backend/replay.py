@@ -88,7 +88,10 @@ async def replay_window(board_id: str,
     await board_ctx(board_id, user, "viewer")
     hist = history_service.for_board(board_id)
     doc = await manager.get_doc(board_id)
-    target = max(0, (doc.head_rev if rev is None else rev) - 1)
+    # 目标即用户请求的 rev 本身: 快照取 ≤target 的最近一份, 操作页覆盖
+    # (base_rev, target]; 减一会让回放永远落后一个操作, 且在 head 处
+    # 恰好绕过最新快照的快速路径
+    target = max(0, doc.head_rev if rev is None else rev)
     loop = asyncio.get_running_loop()
     window = await loop.run_in_executor(
         None, lambda: hist.replay_window(target, coalesce=coalesce, page_limit=limit))
