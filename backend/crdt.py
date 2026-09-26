@@ -277,7 +277,7 @@ def validate_op(op: Any) -> Optional[Dict[str, Any]]:
         dy = _finite_number(op.get("dy"))
         if not target or dx is None or dy is None:
             return None
-        if dx == 0 or dy == 0:
+        if dx == 0 and dy == 0:
             return None                            # 空移动直接丢弃
         clean.update({"id": target, "dx": dx, "dy": dy})
     elif op_type == "set_props":
@@ -433,8 +433,8 @@ class BoardDoc:
 
         if kind == "move":
             # 增量对已删除图形同样累计(复活后位置正确, 且满足交换律)
-            shape["x"] = round(float(shape.get("x") or 0) + float(op["dy"]), 6)
-            shape["y"] = round(float(shape.get("y") or 0) + float(op["dx"]), 6)
+            shape["x"] = round(float(shape.get("x") or 0) + float(op["dx"]), 6)
+            shape["y"] = round(float(shape.get("y") or 0) + float(op["dy"]), 6)
             return True
 
         if kind == "path_extend":
@@ -555,6 +555,8 @@ class BoardDoc:
             "lam_witness": self.lam_witness,
             "saved_at": now_ms(),
             "shapes": {sid: dict(shape) for sid, shape in self.shapes.items()},
+            # 幂等去重窗口必须跨重启存活; 否则重启后重发旧 move 会再次累加。
+            "seen": [[op_id, rev] for op_id, rev in self._seen.items()],
         }
 
     def visible_shapes(self) -> List[Dict[str, Any]]:
@@ -586,6 +588,13 @@ class BoardDoc:
         self.dirty_ops_since_snapshot = 0
         self._max_z = max((float(s.get("z") or 0) for s in self.shapes.values()), default=0.0)
         self._seen.clear()
+        for entry in snapshot.get("seen") or []:
+            if isinstance(entry, (list, tuple)) and len(entry) == 2:
+                op_id, rev = str(entry[0] or ""), int(entry[1] or 0)
+                if op_id and rev > 0:
+                    self._seen[op_id] = rev
+        while len(self._seen) > SEEN_OPS_LIMIT:
+            self._seen.popitem(last=False)
 
     def fold(self, ops: List[Dict[str, Any]]) -> int:
         """按顺序折叠一批(已清洗)操作, 返回实际生效数量。"""

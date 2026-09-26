@@ -541,6 +541,9 @@ socket.on('welcome', async (msg) => {
     for (const s of msg.state.shapes || []) shapes.set(s.id, s);
     engine.rebuildIndex();
     syncZCounter(shapes);
+    if (msg.state.reason && msg.state.reason !== 'initial') {
+      toast('检测到断线补发缺口, 已安全切换为全量状态同步', 'warn', 5000);
+    }
   } else if (msg.catchup?.ops?.length) {
     for (const op of msg.catchup.ops) crdt.witness(op);
     const touched = mergeOps(shapes, msg.catchup.ops);
@@ -566,6 +569,19 @@ socket.on('ops', (msg) => {
   engine.onShapesChanged(touched);
   updateStats();
   scheduleThumbnail();
+});
+
+socket.on('own_ops_replay', (msg) => {
+  for (const op of msg.ops || []) crdt.witness(op);
+  const touched = mergeOps(shapes, msg.ops || []);
+  invalidateFromOps(msg.ops || []);
+  engine.onShapesChanged(touched);
+  updateStats();
+  scheduleThumbnail();
+});
+
+socket.on('sync_fallback', () => {
+  toast('补发数据不完整, 正在重新获取全量状态…', 'warn', 5000);
 });
 
 socket.on('ack', () => updateStats());

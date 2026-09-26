@@ -73,8 +73,3 @@ class SettingsPatchReq(BaseModel):
 # ---------------------------------------------------------------- 回放/历史
 class CompactReq(BaseModel):
     confirm: bool = False
-
-
-def limit_catchup(gap: int, ring_capacity: int, max_catchup: int) -> bool:
-    """判断断线补发是否应直接降级为全量快照。"""
-    return gap > ring_capacity and gap > max_catchup

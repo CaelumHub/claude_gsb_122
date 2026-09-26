@@ -83,7 +83,7 @@ class BoardHistory:
     # ---------------------------------------------------------------- 读取
     def iter_ops(self, from_rev: int = 0, to_rev: Optional[int] = None,
                  limit: Optional[int] = None) -> List[Dict[str, Any]]:
-        """按 rev 升序返回 (from_rev, to_rev] 区间的操作(线性扫相关分片)。"""
+        """按 rev 升序返回 (from_rev, to_rev] 区间的全部操作(线性扫相关分片)。"""
         out: List[Dict[str, Any]] = []
         for meta in self.shards_index():
             last = meta.get("last_rev")
@@ -94,16 +94,33 @@ class BoardHistory:
                 break
             for rec in self.log.read_shard(meta["name"]):
                 rev = rec.get("rev") or 0
-                if rev > from_rev and (to_rev is None or rev <= to_rev) and rec.get("type") != "move":
+                if rev > from_rev and (to_rev is None or rev <= to_rev):
                     out.append(rec)
                     if limit and len(out) >= limit:
                         return out
         out.sort(key=lambda r: r.get("rev") or 0)
         return out
 
-    def recent_ops(self, since_rev: int, limit: int = config.MAX_CATCHUP_OPS) -> List[Dict[str, Any]]:
-        """断线补发用: 返回 since_rev 之后的全部操作(升序, 带截断标记)。"""
-        ops = self.iter_ops(from_rev=since_rev, limit=limit)
+    def read_catchup(self, since_rev: int, head_rev: int,
+                     limit: int = config.MAX_CATCHUP_OPS) -> Optional[List[Dict[str, Any]]]:
+        """读取完整断线缺口。
+
+        只有磁盘日志能证明 (since_rev, head_rev] 的每个 rev 都存在且唯一、
+        并按序返回时才补发；历史分片缺失、旧日志漏记 move、或结果被 limit
+        截断时一律返回 None，由调用方降级为全量状态。
+        """
+        since_rev = max(0, int(since_rev or 0))
+        head_rev = max(since_rev, int(head_rev or 0))
+        gap = head_rev - since_rev
+        if gap <= 0:
+            return []
+        if gap > limit:
+            return None
+        ops = self.iter_ops(from_rev=since_rev, to_rev=head_rev, limit=gap)
+        revs = [int(op.get("rev") or 0) for op in ops]
+        expected = list(range(since_rev + 1, head_rev + 1))
+        if revs != expected:
+            return None
         return ops
 
     def op_stats(self) -> Dict[str, Any]:
@@ -195,7 +212,7 @@ class BoardHistory:
         """
         snapshot = self.load_snapshot(at_rev)
         base_rev = int((snapshot or {}).get("rev") or 0)
-        ops = self.iter_ops(from_rev=base_rev + 1, to_rev=at_rev, limit=page_limit)
+        ops = self.iter_ops(from_rev=base_rev, to_rev=at_rev, limit=page_limit)
         if coalesce:
             from .crdt import coalesce_moves
             ops = coalesce_moves(ops, config.MOVE_COALESCE_WINDOW_MS)

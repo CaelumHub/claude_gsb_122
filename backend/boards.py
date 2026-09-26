@@ -152,8 +152,17 @@ class BoardManager:
             if snapshot:
                 doc.import_state(snapshot)
             base_rev = doc.head_rev
+            # 旧快照可能没有 persisted seen; 用仍保留的历史日志补齐去重
+            # 窗口, 保证重启后未 ack 客户端重发旧操作不会第二次生效。
+            for raw in hist.iter_ops(from_rev=0, to_rev=base_rev):
+                op_id = str(raw.get("op_id") or "")
+                rev = int(raw.get("rev") or 0)
+                if op_id and rev > 0:
+                    doc._seen[op_id] = rev
+            while len(doc._seen) > 8192:
+                doc._seen.popitem(last=False)
             max_rev = base_rev
-            for raw in hist.iter_ops(from_rev=base_rev + 1):
+            for raw in hist.iter_ops(from_rev=base_rev):
                 clean = validate_op(raw)
                 if clean:
                     doc.apply_op(clean)
@@ -223,7 +232,8 @@ class BoardManager:
                 accepted.append(clean)
             if accepted:
                 hist = history_service.for_board(board_id)
-                stamped = [op for op in accepted if "rev" in op and op.get("type") != "move"]
+                stamped = [op for op in accepted
+                           if "rev" in op and not op.get("dup")]
                 await asyncio.get_running_loop().run_in_executor(
                     None, hist.append_ops, stamped)
                 meta = self.metas.get(board_id)

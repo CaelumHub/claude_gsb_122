@@ -10,6 +10,7 @@
 
 协议(服务端 → 客户端):
     welcome    {you, board, role, head_rev, clients, state?|catchup?}
+    catchup    {from_rev, to_rev, ops, source}; rev 必须逐号连续
     ack        {acks:[{op_id, rev, dup?}], head_rev}
     ops        {ops:[...带 rev/by], head_rev, by}  他人的操作广播
     presence   {clients:{cid: {...}}}             在线状态全量
@@ -23,8 +24,10 @@
 **难点: 断线重连状态同步与操作补发**
 - 客户端持久化 last_rev 与「未 ack 操作队列」; 重连时 hello 带上
   last_rev, 服务端优先从内存环形缓冲取 (last_rev, head] 区间操作,
-  缓冲不够则回落到磁盘分片日志; 差距过大(>MAX_CATCHUP_OPS 或无
-  last_rev)直接发全量 state, 客户端丢弃本地重建。
+  缓冲不够则回落到磁盘分片日志。只有来源能证明区间内每个 rev 都
+  唯一、连续且抵达 head 时才补发; 否则明确发送全量 state。
+- 所有非 dup 操作(含 move)都必须进入内存环、磁盘日志与他人广播,
+  补发链路不得以“中间态可合并”为理由静默过滤。
 - 客户端把断线期间产生的操作先入本地队列, 重连后补发; 服务端按
   op_id 幂等去重(返回 dup ack), CRDT 语义保证迟到操作照样正确合并。
 - 慢客户端保护: 每连接独立发送队列+发送协程; 队列溢出时丢弃
@@ -44,7 +47,6 @@ from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 from . import auth, chat as chat_mod, config
 from .boards import manager
 from .history import history_service
-from .models import limit_catchup
 
 router = APIRouter()
 
@@ -57,7 +59,7 @@ class Client:
 
     __slots__ = ("ws", "board_id", "client_id", "user", "role", "last_rev",
                  "page", "queue", "sender_task", "connected_at", "last_seen",
-                 "cursor", "tool", "selection", "closed")
+                 "cursor", "tool", "selection", "closed", "ready")
 
     def __init__(self, ws: WebSocket, board_id: str, client_id: str,
                  user: Dict[str, Any], role: str, page: str = "editor"):
@@ -76,6 +78,8 @@ class Client:
         self.tool: str = ""
         self.selection: List[str] = []
         self.closed = False
+        # welcome(全量/补发)尚未入发送队列前不收广播, 防止旧状态覆盖新操作。
+        self.ready = False
 
     @property
     def key(self) -> str:
@@ -119,11 +123,32 @@ class Room:
         for op in ops:
             self.ring.append(op)
 
-    def catchup_from_ring(self, last_rev: int) -> Optional[List[Dict[str, Any]]]:
-        """若环形缓冲覆盖 (last_rev, head] 全区间则返回切片, 否则 None。"""
-        if not self.ring:
+    def catchup_from_ring(self, last_rev: int,
+                         head_rev: int) -> Optional[List[Dict[str, Any]]]:
+        """仅当环形缓冲完整覆盖 (last_rev, head_rev] 时返回补发操作。
+
+        deque 只知道当前保留了哪些 rev，不能用“rev > last_rev 的过滤结果”
+        代替完整性证明: 服务重启或缓冲回绕后，过滤结果可能只是缺口的后
+        半段。这里逐号校验期望 rev，缺失/重复/超前都返回 None 触发降级。
+        """
+        gap = head_rev - last_rev
+        if gap <= 0:
             return []
-        return [op for op in self.ring if int(op.get("rev") or 0) > last_rev]
+        if gap > len(self.ring) or gap > config.MAX_CATCHUP_OPS:
+            return None
+        by_rev: Dict[int, Dict[str, Any]] = {}
+        for op in self.ring:
+            rev = int(op.get("rev") or 0)
+            if rev in by_rev:
+                return None
+            by_rev[rev] = op
+        ops: List[Dict[str, Any]] = []
+        for rev in range(last_rev + 1, head_rev + 1):
+            op = by_rev.get(rev)
+            if op is None:
+                return None
+            ops.append(op)
+        return ops
 
     @property
     def empty(self) -> bool:
@@ -157,6 +182,8 @@ class ConnectionManager:
             return
         dead: List[Client] = []
         for client in list(room.clients.values()):
+            if not client.ready:
+                continue
             if exclude_client and client.key == exclude_client:
                 continue
             if not client.offer(message):
@@ -169,7 +196,8 @@ class ConnectionManager:
             await self.disconnect(client, reason="send-overflow")
 
     def room_snapshot_clients(self, room: Room) -> Dict[str, Any]:
-        return {c.key: c.presence_dict() for c in room.clients.values()}
+        return {c.key: c.presence_dict()
+                for c in room.clients.values() if c.ready}
 
     # ------------------------------------------------------------ 断开
     async def disconnect(self, client: Client, reason: str = "") -> None:
@@ -241,43 +269,58 @@ class ConnectionManager:
         client.sender_task = asyncio.create_task(self._sender_loop(client))
 
         doc = await manager.get_doc(board_id)
-        head_rev = doc.head_rev
 
-        # -------- 断线补发判定: ring → 磁盘 → 全量快照 ---------
-        welcome: Dict[str, Any] = {
-            "type": "welcome",
-            "you": client.presence_dict(),
-            "board": {k: meta.get(k) for k in ("id", "name", "mode", "owner", "tags")},
-            "role": client.role,
-            "head_rev": head_rev,
-            "clients": self.room_snapshot_clients(room),
-            "server_time": int(time.time() * 1000),
-        }
-        gap = head_rev - client.last_rev
-        if client.last_rev == 0 or limit_catchup(gap, config.RING_BUFFER_OPS,
-                                                 config.MAX_CATCHUP_OPS):
-            welcome["state"] = {
-                "rev": head_rev,
-                "shapes": doc.visible_shapes(),
+        async with manager.lock_for(board_id):
+            target_rev = doc.head_rev
+
+            def _full_state(reason: str) -> Dict[str, Any]:
+                return {"rev": target_rev, "shapes": doc.visible_shapes(),
+                        "reason": reason}
+
+            # -------- 断线补发判定: 只接受可证明完整的连续 rev 区间 ---------
+            welcome: Dict[str, Any] = {
+                "type": "welcome",
+                "you": client.presence_dict(),
+                "board": {k: meta.get(k) for k in ("id", "name", "mode", "owner", "tags")},
+                "role": client.role,
+                "head_rev": target_rev,
+                "clients": self.room_snapshot_clients(room),
+                "server_time": int(time.time() * 1000),
             }
-        elif gap > 0:
-            ops = room.catchup_from_ring(client.last_rev)
-            source = "ring"
-            if ops is None:
-                hist = history_service.for_board(board_id)
-                ops = await asyncio.get_running_loop().run_in_executor(
-                    None, lambda: hist.recent_ops(client.last_rev, config.MAX_CATCHUP_OPS))
-                source = "disk"
-                if len(ops) > config.MAX_CATCHUP_OPS - 1:
-                    # 磁盘上依然太多 → 直接给全量
-                    ops = None
-            if ops is None:
-                welcome["state"] = {"rev": head_rev, "shapes": doc.visible_shapes()}
-            else:
-                welcome["catchup"] = {"from_rev": client.last_rev,
-                                      "ops": ops, "source": source}
-        await self.send(client, welcome)
-        client.last_rev = head_rev
+            gap = target_rev - client.last_rev
+            if client.last_rev <= 0:
+                welcome["state"] = _full_state("initial")
+            elif gap < 0:
+                # 客户端 rev 比服务端还新(通常来自服务端回滚/换数据目录)。
+                # 增量补发无法建立共同前缀, 明确退回全量。
+                welcome["state"] = _full_state("server_rollback")
+            elif gap > config.MAX_CATCHUP_OPS:
+                welcome["state"] = _full_state("catchup_too_large")
+            elif gap > 0:
+                # 在操作锁内固定 target_rev; 先 ring, 再磁盘。任一来源无法
+                # 证明 rev 连续, 就在同一临界区改给 target_rev 的全量状态。
+                ops = room.catchup_from_ring(client.last_rev, target_rev)
+                source = "ring"
+                if ops is None:
+                    hist = history_service.for_board(board_id)
+                    ops = await asyncio.get_running_loop().run_in_executor(
+                        None, hist.read_catchup, client.last_rev,
+                        target_rev, config.MAX_CATCHUP_OPS)
+                    source = "disk"
+                if ops is None:
+                    welcome["state"] = _full_state("incomplete_catchup")
+                else:
+                    welcome["catchup"] = {
+                        "from_rev": client.last_rev,
+                        "to_rev": target_rev,
+                        "ops": ops,
+                        "source": source,
+                    }
+            # welcome 先入该连接自己的队列, 然后才允许广播给它, 保证不会
+            # 出现“先收到 rev=N+1, 后收到旧全量状态”的倒序覆盖。
+            await self.send(client, welcome)
+            client.last_rev = target_rev
+            client.ready = True
 
         await self.broadcast(board_id, {
             "type": "join", "client_id": client.client_id,
@@ -356,7 +399,7 @@ class ConnectionManager:
         acks = [{"op_id": op["op_id"], "rev": op.get("rev"),
                  **({"dup": True} if op.get("dup") else {})} for op in accepted]
         await self.send(client, {"type": "ack", "acks": acks, "head_rev": head_rev})
-        fresh = [op for op in accepted if not op.get("dup") and op.get("type") != "move"]
+        fresh = [op for op in accepted if not op.get("dup")]
         if fresh:
             room.remember(fresh)
             await self.broadcast(client.board_id, {

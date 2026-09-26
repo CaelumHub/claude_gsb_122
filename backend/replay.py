@@ -88,7 +88,7 @@ async def replay_window(board_id: str,
     await board_ctx(board_id, user, "viewer")
     hist = history_service.for_board(board_id)
     doc = await manager.get_doc(board_id)
-    target = max(0, (doc.head_rev if rev is None else rev) - 1)
+    target = doc.head_rev if rev is None else max(0, rev)
     loop = asyncio.get_running_loop()
     window = await loop.run_in_executor(
         None, lambda: hist.replay_window(target, coalesce=coalesce, page_limit=limit))
